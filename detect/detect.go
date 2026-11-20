@@ -90,8 +90,17 @@ type Detector struct {
 	// a list of known findings that should be ignored
 	baseline []report.Finding
 
-	// path to baseline
+	// path to baseline (relative to the scan source, slash-normalized)
 	baselinePath string
+
+	// absolute path to baseline (slash-normalized), used to keep the
+	// baseline file itself out of the scan surface regardless of whether
+	// the scan source was given as a relative or absolute path
+	baselineAbsPath string
+
+	// absolute path of the scan source at the time the baseline was
+	// loaded, used to normalize finding paths before baseline comparison
+	baselineSource string
 
 	// gitleaksIgnore
 	gitleaksIgnore map[string]struct{}
@@ -293,7 +302,7 @@ func (d *Detector) DetectContext(ctx context.Context, fragment Fragment) []repor
 	// check if filepath is allowed
 	if fragment.FilePath != "" {
 		// is the path our config or baseline file?
-		if fragment.FilePath == d.Config.Path || (d.baselinePath != "" && fragment.FilePath == d.baselinePath) {
+		if fragment.FilePath == d.Config.Path || d.isBaselinePath(fragment.FilePath) {
 			logging.Trace().Msg("skipping file: matches config or baseline path")
 			return findings
 		}
@@ -733,11 +742,17 @@ func (d *Detector) AddFinding(finding report.Finding) {
 		}
 	}
 
-	if d.baseline != nil && !IsNew(finding, d.Redact, d.baseline) {
-		logger.Debug().
-			Str("fingerprint", finding.Fingerprint).
-			Msgf("skipping finding: baseline")
-		return
+	if d.baseline != nil {
+		// 比对前把 finding 的 File 归一到与基线登记相同的源内相对形态，
+		// 使基线排除与调用源形态（相对/绝对）无关；finding 本身不被修改
+		normalizedFinding := finding
+		normalizedFinding.File = relPathToSource(d.baselineSource, finding.File)
+		if !IsNew(normalizedFinding, d.Redact, d.baseline) {
+			logger.Debug().
+				Str("fingerprint", finding.Fingerprint).
+				Msgf("skipping finding: baseline")
+			return
+		}
 	}
 
 	d.findingMutex.Lock()

@@ -325,7 +325,9 @@ func Detector(cmd *cobra.Command, cfg config.Config, source string) *detect.Dete
 	if baselinePath != "" {
 		err = detector.AddBaseline(baselinePath, source)
 		if err != nil {
-			logging.Error().Msgf("Could not load baseline. The path must point of a gitleaks report generated using the default format: %s", err)
+			// 基线是增量治理的闸门：缺失、损坏或格式不受支持时必须显式失败，
+			// 不允许静默降级为无基线全量扫描
+			logging.Fatal().Err(err).Msg("Could not load baseline. The path must point to a gitleaks report generated using the default json format")
 		}
 	}
 

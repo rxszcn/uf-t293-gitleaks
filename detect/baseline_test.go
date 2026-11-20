@@ -1,13 +1,18 @@
 package detect
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/zricethezav/gitleaks/v8/report"
+	"github.com/zricethezav/gitleaks/v8/sources"
 )
 
 func TestIsNew(t *testing.T) {
@@ -228,5 +233,108 @@ func TestIgnoreIssuesInBaseline(t *testing.T) {
 			d.AddFinding(finding)
 		}
 		assert.Len(t, d.findings, test.expectCount)
+	}
+}
+
+// baselineMatrixSecret 命中默认配置 generic-api-key 规则（entropy 3.5）的测试密钥
+const baselineMatrixSecret = `const api_key = "e7322523fb86ed64c836a979cf8465fbd436378c653c1db38f9ae87bc62a6fd5"`
+
+// TestBaselineSourceAndLocationMatrix 覆盖基线机制的输入矩阵：
+// {相对源, 绝对源} x {根级基线, 子目录基线} 固定四组。
+// 验证两种调用形态与两种基线存放位置下基线均生效（基线登记的历史泄露被剔除），
+// 且基线报告文件自身不进入扫描面（基线内登记的历史密钥不被二次报成新泄露）。
+//
+// 注意：本测试通过 t.Chdir 构造相对路径调用形态，不能标记为 parallel。
+func TestBaselineSourceAndLocationMatrix(t *testing.T) {
+	tests := map[string]struct {
+		absoluteSource bool
+		baselineSubDir bool
+	}{
+		"相对源 + 根级基线":   {absoluteSource: false, baselineSubDir: false},
+		"相对源 + 子目录基线":  {absoluteSource: false, baselineSubDir: true},
+		"绝对源 + 根级基线":   {absoluteSource: true, baselineSubDir: false},
+		"绝对源 + 子目录基线": {absoluteSource: true, baselineSubDir: true},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "key.txt"), []byte(baselineMatrixSecret), 0o644))
+
+			// 本地开发者形态：在仓库目录内以相对路径发起全量扫描建档，
+			// 基线登记的 File 为相对形态
+			t.Chdir(tmpDir)
+			baselineRelPath := "baseline.json"
+			if tt.baselineSubDir {
+				require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "reports"), 0o755))
+				baselineRelPath = filepath.Join("reports", "baseline.json")
+			}
+
+			createDetector, err := NewDetectorDefaultConfig()
+			require.NoError(t, err)
+			baselineFindings, err := createDetector.DetectSource(context.Background(), &sources.Files{
+				Config: &createDetector.Config,
+				Path:   ".",
+				Sema:   createDetector.Sema,
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, baselineFindings, "全量扫描应检出测试密钥，否则基线为空无法验证增量放行")
+
+			data, err := json.Marshal(baselineFindings)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, baselineRelPath), data, 0o644))
+
+			// 按矩阵指定的调用形态与基线位置发起增量扫描
+			source := "."
+			baselinePath := baselineRelPath
+			if tt.absoluteSource {
+				source = tmpDir
+				baselinePath = filepath.Join(tmpDir, baselineRelPath)
+			}
+
+			d, err := NewDetectorDefaultConfig()
+			require.NoError(t, err)
+			require.NoError(t, d.AddBaseline(baselinePath, source))
+
+			findings, err := d.DetectSource(context.Background(), &sources.Files{
+				Config: &d.Config,
+				Path:   source,
+				Sema:   d.Sema,
+			})
+			require.NoError(t, err)
+			assert.Empty(t, findings, "基线登记的历史泄露应被剔除，且基线报告自身不应进入扫描面")
+		})
+	}
+}
+
+// TestAddBaselineLoadFailure 覆盖基线加载失败形态：
+// 基线文件缺失、内容损坏、内容无效（如旧版本格式产生的 null）时，
+// AddBaseline 必须显式返回错误且不装配任何基线，
+// 由命令装配入口决定显式失败，不再静默降级为无基线全量扫描。
+func TestAddBaselineLoadFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	corruptPath := filepath.Join(tmpDir, "corrupt.json")
+	require.NoError(t, os.WriteFile(corruptPath, []byte("{not-json"), 0o644))
+
+	nullPath := filepath.Join(tmpDir, "null.json")
+	require.NoError(t, os.WriteFile(nullPath, []byte("null"), 0o644))
+
+	tests := map[string]struct {
+		baselinePath string
+	}{
+		"基线文件缺失":      {baselinePath: filepath.Join(tmpDir, "missing.json")},
+		"基线内容损坏":      {baselinePath: corruptPath},
+		"基线内容无效(null)": {baselinePath: nullPath},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			d, err := NewDetectorDefaultConfig()
+			require.NoError(t, err)
+			err = d.AddBaseline(tt.baselinePath, tmpDir)
+			require.Error(t, err, "基线加载失败必须显式返回错误")
+			assert.Nil(t, d.baseline, "加载失败时不应装配任何基线")
+		})
 	}
 }
